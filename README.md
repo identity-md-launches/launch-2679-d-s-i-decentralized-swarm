@@ -78,14 +78,16 @@ default. Environment variables override the file:
    watermark). A scan at block N reads the store and fetches only blocks above the watermark, then
    appends them; a second scan over the same range makes no log requests at all. For a missing range
    the Blockscout logs API is asked first; if it does not answer (timeout, 429, error) the range
-   comes from chunked `eth_getLogs`, which halves its chunk on any refusal or timeout, doubles it
+   comes from chunked `eth_getLogs`, which halves its chunk on any refusal, timeout or JSON-RPC
+   range/result-limit error (any other JSON-RPC error rotates to the next endpoint), doubles it
    again after a success, and saves the watermark after every chunk so an interrupted backfill resumes.
 3. **Owned contracts and accounts.** Candidates are the emitting contracts of `OwnershipTransferred`
    and `RoleGranted`, the `account` of the MSCA / plugin events, the Safes the Safe Transaction Service
    lists under `owners/<wallet>/safes`, and the `--candidates` file. Each is confirmed at the report
    block with `owner()`, `getNativeOwner()`, `isOwner(wallet)`, `hasRole(role, wallet)` for every role
    seen granted, and `plugin.getOwnerOf(account)` for plugin events. A candidate is listed as owned
-   only if one of these names the wallet; the rest go to `droppedCandidates`.
+   only if one of these names the wallet; the rest go to `droppedCandidates`. The wallet's own address
+   is never its own candidate, so its balances are counted once.
 4. **Allowances.** Each `(token, spender)` pair from the Approval logs is read with
    `allowance(wallet, spender)` at the report block; only values above zero are listed.
 5. **Value at stake.** ETH and token balances of every owned account, plus the wallet's own balance of
@@ -94,8 +96,11 @@ default. Environment variables override the file:
 All state (owners, roles, allowances, balances, ETH via `getEthBalance`, symbols, decimals) is read
 through Multicall3 `0xcA11bde05977b3631167028862bE2a173976CA11` `aggregate3` at the report block,
 with failures allowed per call. A malformed or short `aggregate3` answer is reported as an error rather
-than treated as a zero balance. Only `eth_getCode` and `eth_getLogs` are separate requests. A Safe
-reported by the Safe Transaction Service is confirmed with `getOwners()` and `getThreshold()`; a
+than treated as a zero balance: the result count must equal the call count, and a body cut off
+before its results, or a null `eth_call` result, is an error for that wallet. Only `eth_getCode` and `eth_getLogs` are separate requests. A Safe
+reported by the Safe Transaction Service, or any candidate confirmed by `isOwner(wallet)` that also
+answers both calls (a Safe from `--candidates`, or with the service disabled or down), is confirmed
+with `getOwners()` and `getThreshold()`; a
 threshold-one Safe is included in owned-account value, while a higher-threshold Safe is shown as
 **Shared control** and excluded from value at stake.
 
@@ -137,6 +142,13 @@ Amounts in `report.json` are decimal strings in base units; `report.md` shows th
 - **Safe and endpoint availability.** The Safe Transaction Service is advisory and may be unavailable;
   a wallet-level RPC failure is recorded in the reports while other wallets continue. A Safe threshold
   of one indicates unilateral execution at that block, not that all other access paths have been found.
+- **Range-limit errors are recognised by wording.** A JSON-RPC `eth_getLogs` error whose message
+  mentions a range, limit or size shrinks the chunk; one worded otherwise retires the endpoint.
+- **Allowance, Safe, role and pagination paths have no recorded mainnet fixture yet.** They are covered
+  by the synthetic chains in `tests/test_units.py` only; the second recording asked for in point 6 of
+  the review is still outstanding. The Blockscout indexed-head entry in the incident fixture was added
+  by hand (decimal form; the live API answers hex, and both are accepted) when the head request was
+  introduced, and equals the last scan block, so the lagging-head case is covered by the unit test only.
 
 ## Tests and fixtures
 
@@ -150,7 +162,10 @@ Amounts in `report.json` are decimal strings in base units; `report.md` shows th
   fails on any request not in the fixture, so the suite cannot reach the network.
 - `tests/test_units.py` covers Keccak-256, the `aggregate3` encoding, delegation parsing, the
   confirmation rules on a synthetic chain (zero allowances and lost ownership are not listed, all reads
-  at the report block), and that the package contains no signing or sending code.
+  at the report block), Safe thresholds (including Safes reached through `--candidates` with the
+  service disabled), short, truncated and null `aggregate3` answers, JSON-RPC error rotation and
+  per-wallet error entries, range-limit chunk shrinking, a lagging explorer's watermark, and that the
+  package contains no signing or sending code.
 - `tests/record_fixture.py` re-records the fixture:
   `DSI_RPC_URLS=<archive mainnet RPC> python3 tests/record_fixture.py`. Only methods, parameters and
   answers are stored, never the endpoint URL. In the recording, Blockscout answered three filters over

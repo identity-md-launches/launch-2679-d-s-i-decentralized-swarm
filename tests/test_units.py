@@ -140,6 +140,42 @@ class ShortMulticallChain(FakeChain):
         return reply
 
 
+class TruncatedMulticallChain(FakeChain):
+    """aggregate3 answers carry the right count word but are cut off before the tuples."""
+
+    def post_rpc(self, url, body, timeout):
+        reply = super().post_rpc(url, body, timeout)
+        if body["method"] == "eth_call":
+            n = len(decode_calls(body["params"][0]["data"]))
+            reply["result"] = "0x" + (abi.word(32) + abi.word(n)).hex()
+        return reply
+
+
+class NullCallChain(FakeChain):
+    def post_rpc(self, url, body, timeout):
+        reply = super().post_rpc(url, body, timeout)
+        if body["method"] == "eth_call":
+            reply["result"] = None
+        return reply
+
+
+class RangeCappedChain(HttpTransport):
+    def __init__(self):
+        super().__init__()
+        self.ranges = []
+
+    def post_rpc(self, url, body, timeout):
+        if body["method"] == "eth_chainId":
+            return {"jsonrpc": "2.0", "id": body["id"], "result": "0x1"}
+        flt = body["params"][0]
+        frm, to = int(flt["fromBlock"], 16), int(flt["toBlock"], 16)
+        self.ranges.append((frm, to))
+        if to - frm + 1 > 10000:
+            return {"jsonrpc": "2.0", "id": body["id"],
+                    "error": {"code": -32005, "message": "query exceeds max block range 10000"}}
+        return {"jsonrpc": "2.0", "id": body["id"], "result": []}
+
+
 class RotatingChain(HttpTransport):
     def __init__(self, fail_wallet=None):
         super().__init__()
@@ -280,6 +316,56 @@ class Units(unittest.TestCase):
                 self.assertEqual(len(json.load(f)), 2)
             with open(os.path.join(d, "report.md")) as f:
                 self.assertIn(SECOND_WALLET, f.read().lower())
+
+    def _cfg(self, d, **extra):
+        cfg = load_config(None, env={})
+        return {**cfg, "rpcUrls": ["https://example.invalid"], "tokens": [],
+                "history": {**cfg["history"], "sources": ["rpc"], "cacheDir": d}, **extra}
+
+    def test_truncated_multicall_body_is_an_error(self):
+        with self.assertRaises(ValueError):
+            abi.decode_aggregate3("0x" + (abi.word(32) + abi.word(2)).hex())
+        with self.assertRaises(ValueError):  # a huge count is refused before anything is allocated
+            abi.decode_aggregate3("0x" + (abi.word(32) + abi.word(2 ** 40)).hex())
+        with tempfile.TemporaryDirectory() as d:
+            r = Scanner(self._cfg(d), TruncatedMulticallChain()).scan([WALLET], block=100)[0]
+        self.assertIn("malformed", r["error"])
+        self.assertNotIn("ownedAccounts", r)
+
+    def test_null_eth_call_result_is_a_wallet_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            reports = Scanner(self._cfg(d), NullCallChain()).scan([WALLET, SECOND_WALLET], block=100)
+        self.assertEqual(len(reports), 2)
+        self.assertIn("error", reports[0])
+
+    def test_safe_from_candidates_file_follows_threshold(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = self._cfg(d, safeTransactionService="")
+            r = Scanner(cfg, SafeChain()).scan([WALLET], block=100, candidates=[SAFE_SHARED, SAFE_ONE])[0]
+        self.assertEqual([e["address"].lower() for e in r["sharedControl"]], [SAFE_SHARED])
+        self.assertEqual(r["sharedControl"][0]["threshold"], 2)
+        owned = {e["address"].lower(): e for e in r["ownedAccounts"]}
+        self.assertEqual(set(owned), {STILL_OWNED, SAFE_ONE})
+        self.assertEqual(owned[SAFE_ONE]["threshold"], 1)
+        self.assertEqual(r["valueAtStake"][0]["ownedAccounts"], str(2 * 10 ** 18))  # the shared Safe is not counted
+
+    def test_wallet_is_not_its_own_candidate(self):
+        with tempfile.TemporaryDirectory() as d:
+            r = Scanner(self._cfg(d), FakeChain()).scan([WALLET], block=100, candidates=[WALLET])[0]
+        self.assertEqual([o["address"].lower() for o in r["ownedAccounts"]], [STILL_OWNED])
+        self.assertEqual(r["valueAtStake"][0]["total"], str(2 * 10 ** 18))
+
+    def test_getlogs_range_limit_error_shrinks_the_chunk(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = load_config(None, env={})
+            cfg = {**cfg, "history": {**cfg["history"], "sources": ["rpc"], "cacheDir": d,
+                                      "rpcStartBlock": 0, "rpcChunkBlocks": 50000}}
+            chain = RangeCappedChain()
+            rpc = RpcClient(chain, ["https://rpc.one", "https://rpc.two"], 1, 1)
+            _, coverage = LogHistory(cfg, rpc, chain).logs([T_APPROVAL, pad_topic(WALLET)], 40000)
+        self.assertEqual(coverage["toBlock"], 40000)
+        self.assertEqual(rpc.index, 0)
+        self.assertLess(chain.ranges[-1][1] - chain.ranges[-1][0], 10000)  # last chunk answered, under the cap
 
     def test_read_only(self):
         forbidden = re.compile(r"eth_send|eth_sign|personal_|signTransaction|private_?key", re.I)

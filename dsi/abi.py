@@ -51,15 +51,26 @@ def _u(data: bytes, pos: int) -> int:
 def decode_aggregate3(hexdata: str):
     """Returns list of (success, return_data bytes)."""
     data = bytes.fromhex(hexdata[2:])
-    base = _u(data, 0)
-    n = _u(data, base)
+
+    def u(pos):
+        # Unlike _u, a word past the end of the body is a malformed answer, not a zero.
+        if pos + 32 > len(data):
+            raise ValueError("aggregate3 result truncated")
+        return _u(data, pos)
+
+    base = u(0)
+    n = u(base)
     arr = base + 32
+    if n > len(data) // 32:  # every result needs at least its offset word
+        raise ValueError(f"aggregate3 result count {n} exceeds the body")
     results = []
     for i in range(n):
-        t = arr + _u(data, arr + 32 * i)
-        success = _u(data, t) == 1
-        b = t + _u(data, t + 32)
-        length = _u(data, b)
+        t = arr + u(arr + 32 * i)
+        success = u(t) == 1
+        b = t + u(t + 32)
+        length = u(b)
+        if b + 32 + length > len(data):
+            raise ValueError("aggregate3 return data truncated")
         results.append((success, data[b + 32:b + 32 + length]))
     return results
 

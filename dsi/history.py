@@ -12,9 +12,13 @@ Sources, tried in the configured order for every missing range:
 import hashlib
 import json
 import os
+import re
 import urllib.parse
 
 from .transport import RpcError, TransportError
+
+# How public nodes word "this eth_getLogs request is too large" in a JSON-RPC error.
+RANGE_LIMIT = re.compile(r"range|limit|too many|too large|exceed|max(imum)? .*(blocks|results)|response size", re.I)
 
 
 class HistoryUnavailable(Exception):
@@ -172,7 +176,12 @@ class LogHistory:
                 self.getlogs_calls += 1
                 found = self.rpc.call("eth_getLogs", [flt], rotate=False)
             except RpcError as e:
-                # A JSON-RPC error is an endpoint failure, not an empty range.
+                if chunk > 1 and RANGE_LIMIT.search(str(e)):
+                    # A range or result-size limit is a property of the request: shrink it.
+                    chunk = max(1, chunk // 2)
+                    self.log(f"history: eth_getLogs {frm}-{end} refused ({e}); chunk now {chunk}")
+                    continue
+                # Any other JSON-RPC error is an endpoint failure, not an empty range.
                 # Rotate before retrying this exact chunk on the next endpoint.
                 self.rpc.retire_current(str(e))
                 if self.rpc.index >= len(self.rpc.urls):

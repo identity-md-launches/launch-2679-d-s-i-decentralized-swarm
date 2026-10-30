@@ -67,6 +67,8 @@ class Scanner:
             batch = [(t, True, d) for t, d in calls[i:i + size]]
             data = abi.encode_aggregate3(batch)
             ret = state.call("eth_call", [{"to": abi.MULTICALL3, "data": data}, hex(block)])
+            if not isinstance(ret, str):
+                raise TransportError(f"Multicall3 aggregate3 returned {ret!r}")
             try:
                 results = abi.decode_aggregate3(ret)
             except (IndexError, ValueError) as e:
@@ -141,6 +143,7 @@ class Scanner:
         for a in extra:
             cand(a, "candidates-file")
         coverage["safeTransactionService"] = safe_status
+        cands.pop(wallet, None)  # a wallet is not an account it controls; its balances are counted once
 
         pairs = sorted({(l["address"], topic_address(l["topics"][2])) for l in found["approval"] if len(l["topics"]) == 3})
         return cands, pairs, coverage
@@ -173,6 +176,20 @@ class Scanner:
             hit = abi.as_address(ret) == wallet if kind == "address" else abi.as_bool(ret) is True
             if hit:
                 confirmed.setdefault(addr, []).append(label)
+        # A Safe can arrive without the Transaction Service (candidates file, service
+        # disabled or down). Anything confirmed by isOwner(wallet) is asked for its
+        # threshold and owners too, and treated as a Safe when it answers both.
+        probe = sorted(a for a, labels in confirmed.items() if "isOwner(wallet)" in labels and not cands[a].get("safe"))
+        if probe:
+            calls = [(a, abi.call_data(sig)) for a in probe for sig in ("getThreshold()", "getOwners()")]
+            res = self.multicall(calls, block, state)
+            for i, a in enumerate(probe):
+                (ok_t, t), (ok_o, o) = res[2 * i], res[2 * i + 1]
+                threshold = abi.as_uint(t) if ok_t else None
+                owners = abi.as_addresses(o) if ok_o else None
+                if threshold is not None and owners is not None:
+                    safe_state[a] = {"threshold": threshold, "owners": owners}
+                    cands[a]["safe"] = True
         owned, dropped, shared = [], [], []
         for addr, c in sorted(cands.items()):
             entry = {"address": checksum(addr), "sources": sorted(c["sources"])}
