@@ -2,6 +2,7 @@
 (allowance read at the block and > 0; a candidate the wallet lost is not owned)."""
 
 import os
+import json
 import re
 import sys
 import tempfile
@@ -14,7 +15,8 @@ from dsi import abi  # noqa: E402
 from dsi.config import load_config  # noqa: E402
 from dsi.keccak import keccak256, selector, topic  # noqa: E402
 from dsi.scan import Scanner, classify_code, pad_topic, T_APPROVAL, T_OWNERSHIP  # noqa: E402
-from dsi.transport import HttpTransport  # noqa: E402
+from dsi.history import LogHistory  # noqa: E402
+from dsi.transport import HttpTransport, RpcClient, TransportError  # noqa: E402
 
 WALLET = "0x1111111111111111111111111111111111111111"
 TOKEN_A = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -23,6 +25,9 @@ SPENDER = "0x5555555555555555555555555555555555555555"
 STILL_OWNED = "0xc0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0"
 GIVEN_AWAY = "0xd0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0"
 OTHER = "0x9999999999999999999999999999999999999999"
+SAFE_ONE = "0x1212121212121212121212121212121212121212"
+SAFE_SHARED = "0x1313131313131313131313131313131313131313"
+SECOND_WALLET = "0x2222222222222222222222222222222222222222"
 
 
 def encode_results(results):
@@ -49,6 +54,10 @@ def decode_calls(hexdata):
         b = t + u(t + 64)
         calls.append((target, data[b + 32:b + 32 + u(b)]))
     return calls
+
+
+def addresses_result(addresses):
+    return abi.word(32) + abi.word(len(addresses)) + b"".join(abi.addr_word(a) for a in addresses)
 
 
 class FakeChain(HttpTransport):
@@ -104,6 +113,73 @@ class FakeChain(HttpTransport):
         return False, b""
 
 
+class SafeChain(FakeChain):
+    def get_json(self, url, timeout):
+        return {"safes": [SAFE_ONE, SAFE_SHARED]}
+
+    def answer(self, target, data):
+        sel = "0x" + data[:4].hex()
+        if target in (SAFE_ONE, SAFE_SHARED):
+            if sel == selector("isOwner(address)"):
+                return True, abi.word(1)
+            if sel == selector("getThreshold()"):
+                return True, abi.word(1 if target == SAFE_ONE else 2)
+            if sel == selector("getOwners()"):
+                return True, addresses_result([WALLET, OTHER])
+            if sel == selector("getEthBalance(address)"):
+                return True, abi.word(3 * 10 ** 18)
+        return super().answer(target, data)
+
+
+class ShortMulticallChain(FakeChain):
+    def post_rpc(self, url, body, timeout):
+        reply = super().post_rpc(url, body, timeout)
+        if body["method"] == "eth_call":
+            calls = decode_calls(body["params"][0]["data"])
+            reply["result"] = encode_results([self.answer(*calls[0])])
+        return reply
+
+
+class RotatingChain(HttpTransport):
+    def __init__(self, fail_wallet=None):
+        super().__init__()
+        self.urls = []
+        self.fail_wallet = fail_wallet
+
+    def get_json(self, url, timeout):
+        return {"safes": []}
+
+    def post_rpc(self, url, body, timeout):
+        self.urls.append(url)
+        method, params = body["method"], body["params"]
+        if method == "eth_chainId":
+            result = "0x1"
+        elif method == "eth_getCode" and (url.endswith("one") or params[0].lower() == self.fail_wallet):
+            return {"jsonrpc": "2.0", "id": body["id"], "error": {"code": -32000, "message": "unavailable"}}
+        elif method == "eth_getCode":
+            result = "0x"
+        elif method == "eth_getLogs":
+            result = []
+        elif method == "eth_call":
+            result = encode_results([FakeChain().answer(t, d) for t, d in decode_calls(params[0]["data"])])
+        else:
+            result = "0x0"
+        return {"jsonrpc": "2.0", "id": body["id"], "result": result}
+
+
+class LaggingExplorer(HttpTransport):
+    def __init__(self):
+        super().__init__()
+        self.head = 10
+        self.ranges = []
+
+    def get_json(self, url, timeout):
+        if "action=eth_block_number" in url:
+            return {"status": "1", "result": str(self.head)}
+        self.ranges.append(url)
+        return {"status": "1", "result": []}
+
+
 class Units(unittest.TestCase):
     def test_keccak(self):
         self.assertEqual(keccak256(b"").hex(), "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470")
@@ -141,6 +217,69 @@ class Units(unittest.TestCase):
         stake = {s["token"].lower(): s for s in r["valueAtStake"]}
         self.assertEqual(stake[TOKEN_A]["wallet"], str(5 * 10 ** 6))  # approved token: wallet balance counts
         self.assertNotIn(TOKEN_B, stake)  # not approved, not held by an owned account
+
+    def test_short_multicall_answer_is_an_error(self):
+        cfg = load_config(None, env={})
+        cfg = {**cfg, "rpcUrls": ["https://example.invalid"], "tokens": [],
+               "history": {**cfg["history"], "sources": ["rpc"]}}
+        with self.assertRaisesRegex(TransportError, "1 results for 2 calls"):
+            Scanner(cfg, ShortMulticallChain()).multicall(
+                [(TOKEN_A, abi.call_data("balanceOf(address)", WALLET)),
+                 (TOKEN_B, abi.call_data("balanceOf(address)", WALLET))], 100,
+                Scanner(cfg, ShortMulticallChain()).rpc)
+
+    def test_safe_threshold_controls_value_at_stake(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = load_config(None, env={})
+            cfg = {**cfg, "rpcUrls": ["https://example.invalid"], "tokens": [],
+                   "history": {**cfg["history"], "sources": ["rpc"], "cacheDir": d}}
+            report = Scanner(cfg, SafeChain()).scan([WALLET], block=100)[0]
+        owned = {entry["address"].lower(): entry for entry in report["ownedAccounts"]}
+        self.assertEqual(owned[SAFE_ONE]["threshold"], 1)
+        self.assertEqual(owned[SAFE_ONE]["owners"][0].lower(), WALLET)
+        self.assertEqual([entry["address"].lower() for entry in report["sharedControl"]], [SAFE_SHARED])
+        self.assertEqual(report["sharedControl"][0]["threshold"], 2)
+        self.assertEqual(report["valueAtStake"][0]["ownedAccounts"], str(2 * 10 ** 18))
+
+    def test_rpc_error_rotates_to_next_endpoint(self):
+        chain = RotatingChain()
+        client = RpcClient(chain, ["https://rpc.one", "https://rpc.two"], 1, 1)
+        self.assertEqual(client.call("eth_getCode", [WALLET, "latest"]), "0x")
+        self.assertIn("https://rpc.one", chain.urls)
+        self.assertIn("https://rpc.two", chain.urls)
+
+    def test_lagging_explorer_watermark_and_later_append(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = load_config(None, env={})
+            cfg = {**cfg, "history": {**cfg["history"], "sources": ["blockscout"], "cacheDir": d}}
+            explorer = LaggingExplorer()
+            history = LogHistory(cfg, None, explorer)
+            _, coverage = history.logs([T_APPROVAL, pad_topic(WALLET)], 20)
+            self.assertEqual(coverage["toBlock"], 10)
+            explorer.head = 20
+            _, coverage = history.logs([T_APPROVAL, pad_topic(WALLET)], 20)
+            self.assertEqual(coverage["toBlock"], 20)
+            self.assertTrue(any("fromBlock=11" in url for url in explorer.ranges))
+
+    def test_failed_wallet_still_writes_other_wallet_report(self):
+        with tempfile.TemporaryDirectory() as d:
+            wallets = os.path.join(d, "wallets.json")
+            config = os.path.join(d, "config.json")
+            with open(wallets, "w") as f:
+                json.dump([WALLET, SECOND_WALLET], f)
+            with open(config, "w") as f:
+                json.dump({"rpcUrls": ["https://rpc.one", "https://rpc.two"],
+                           "archiveRpcUrls": ["https://rpc.one", "https://rpc.two"],
+                           "tokens": [], "history": {"sources": ["rpc"], "cacheDir": os.path.join(d, "cache")}}, f)
+            from dsi.cli import main
+            reports = main(["--wallets", wallets, "--block", "100", "--config", config, "--out", d, "--quiet"],
+                           transport=RotatingChain(fail_wallet=WALLET), env={})
+            self.assertIn("error", reports[0])
+            self.assertNotIn("error", reports[1])
+            with open(os.path.join(d, "report.json")) as f:
+                self.assertEqual(len(json.load(f)), 2)
+            with open(os.path.join(d, "report.md")) as f:
+                self.assertIn(SECOND_WALLET, f.read().lower())
 
     def test_read_only(self):
         forbidden = re.compile(r"eth_send|eth_sign|personal_|signTransaction|private_?key", re.I)

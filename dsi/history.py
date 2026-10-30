@@ -90,7 +90,7 @@ class LogHistory:
         if store is None or store["toBlock"] < to_block:
             store = self._extend(topics, store, to_block)
         logs = [l for l in store["logs"] if store["fromBlock"] <= l["blockNumber"] <= to_block]
-        coverage = {"fromBlock": store["fromBlock"], "toBlock": to_block, "sources": store["sources"]}
+        coverage = {"fromBlock": store["fromBlock"], "toBlock": store["toBlock"], "sources": store["sources"]}
         return logs, coverage
 
     def _extend(self, topics, store, to_block):
@@ -99,10 +99,10 @@ class LogHistory:
             try:
                 if source == "blockscout":
                     start = store["toBlock"] + 1 if store else self.h["blockscoutStartBlock"]
-                    found = self._blockscout(topics, start, to_block)
+                    found, covered_to = self._blockscout(topics, start, to_block)
                     if store is None:
                         store = {"topics": topics, "fromBlock": start, "toBlock": start - 1, "sources": [], "logs": []}
-                    self._append(store, found, to_block, "blockscout")
+                    self._append(store, found, covered_to, "blockscout")
                     self._save(store)
                     return store
                 if source == "rpc":
@@ -118,6 +118,21 @@ class LogHistory:
         raise HistoryUnavailable("; ".join(errors))
 
     def _blockscout(self, topics, start, end):
+        # This action is served from Blockscout's indexed database.  It is not
+        # interchangeable with an RPC node's head: advancing past it would make
+        # a later scan believe unindexed blocks had been searched.
+        head_url = self.h["blockscoutUrl"].rstrip("/") + "/api?module=block&action=eth_block_number"
+        self.blockscout_calls += 1
+        head = self.transport.get_json(head_url, self.h["blockscoutTimeoutSeconds"])
+        if not isinstance(head, dict) or head.get("result") in (None, ""):
+            raise HistoryUnavailable("blockscout returned no indexed head")
+        try:
+            indexed_head = _int(head["result"])
+        except (TypeError, ValueError):
+            raise HistoryUnavailable("blockscout returned an invalid indexed head") from None
+        end = min(end, indexed_head)
+        if end < start:
+            raise HistoryUnavailable(f"blockscout indexed through {indexed_head}, before block {start}")
         out = []
         frm = start
         while True:
@@ -135,13 +150,13 @@ class LogHistory:
             result = body.get("result")
             if body.get("status") != "1":
                 if body.get("message") == "No logs found" and result == []:
-                    return out
+                    return out, end
                 raise HistoryUnavailable(f"blockscout said {body.get('message')!r}")
             if not isinstance(result, list):
                 raise HistoryUnavailable("blockscout returned no list")
             out.extend(result)
             if len(result) < 1000:
-                return out
+                return out, end
             last = _int(result[-1]["blockNumber"])
             if last <= frm:
                 raise HistoryUnavailable("more than one page of logs in a single block")
@@ -156,7 +171,14 @@ class LogHistory:
             try:
                 self.getlogs_calls += 1
                 found = self.rpc.call("eth_getLogs", [flt], rotate=False)
-            except (RpcError, TransportError) as e:
+            except RpcError as e:
+                # A JSON-RPC error is an endpoint failure, not an empty range.
+                # Rotate before retrying this exact chunk on the next endpoint.
+                self.rpc.retire_current(str(e))
+                if self.rpc.index >= len(self.rpc.urls):
+                    raise TransportError(f"no endpoint left for eth_getLogs ({e})")
+                continue
+            except TransportError as e:
                 if self.rpc.index >= len(self.rpc.urls):
                     raise TransportError(f"no endpoint left for eth_getLogs ({e})")
                 if chunk > 1:

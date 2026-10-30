@@ -1,11 +1,12 @@
 """The exposure scan for one list of wallets at one block."""
 
+import re
 import urllib.parse
 
 from . import abi
 from .history import HistoryUnavailable, LogHistory
 from .keccak import topic
-from .transport import RpcClient, TransportError
+from .transport import RpcClient, RpcError, TransportError
 
 T_OWNERSHIP = topic("OwnershipTransferred(address,address)")  # OpenZeppelin Ownable
 # Circle SingleOwnerMSCA and the ERC-6900 v0.7 SingleOwnerPlugin (circlefin/buidl-wallet-contracts)
@@ -16,6 +17,11 @@ T_APPROVAL = topic("Approval(address,address,uint256)")
 
 DELEGATION_PREFIX = "0xef0100"
 UNLIMITED_THRESHOLD = 2 ** 255  # max uint256, and max after the token decremented it
+ADDRESS = re.compile(r"0x[0-9a-fA-F]{40}\Z")
+
+
+def is_address(value):
+    return isinstance(value, str) and bool(ADDRESS.fullmatch(value))
 
 
 def pad_topic(address):
@@ -61,7 +67,13 @@ class Scanner:
             batch = [(t, True, d) for t, d in calls[i:i + size]]
             data = abi.encode_aggregate3(batch)
             ret = state.call("eth_call", [{"to": abi.MULTICALL3, "data": data}, hex(block)])
-            out.extend(abi.decode_aggregate3(ret))
+            try:
+                results = abi.decode_aggregate3(ret)
+            except (IndexError, ValueError) as e:
+                raise TransportError(f"Multicall3 aggregate3 returned malformed results ({e})") from None
+            if len(results) != len(batch):
+                raise TransportError(f"Multicall3 aggregate3 returned {len(results)} results for {len(batch)} calls")
+            out.extend(results)
         return out
 
     # ---- candidates --------------------------------------------------------
@@ -72,7 +84,10 @@ class Scanner:
         url = f"{base.rstrip('/')}/api/v1/owners/{checksum(wallet)}/safes/"
         try:
             body = self.transport.get_json(url, self.cfg["timeoutSeconds"])
-            return [s.lower() for s in body.get("safes", [])], "ok"
+            safes = body.get("safes", [])
+            if not isinstance(safes, list) or any(not is_address(s) for s in safes):
+                raise TransportError("safe service returned an invalid Safe address")
+            return [s.lower() for s in safes], "ok"
         except (TransportError, AttributeError) as e:
             self.log(f"safe service failed for {wallet}: {e}")
             return [], f"unavailable ({e})"
@@ -95,6 +110,9 @@ class Scanner:
         cands = {}
 
         def cand(addr, source):
+            if not is_address(addr):
+                self.log(f"ignoring invalid candidate address from {source}: {addr!r}")
+                return None
             c = cands.setdefault(addr.lower(), {"sources": set(), "roles": set(), "plugins": set()})
             c["sources"].add(source)
             return c
@@ -109,13 +127,17 @@ class Scanner:
             if account == l["address"]:
                 cand(account, "event:SingleOwnerMSCA.OwnershipTransferred")
             else:
-                cand(account, "event:SingleOwnerPlugin.OwnershipTransferred")["plugins"].add(l["address"])
+                item = cand(account, "event:SingleOwnerPlugin.OwnershipTransferred")
+                if item is not None and is_address(l["address"]):
+                    item["plugins"].add(l["address"])
         for l in found["roleGranted"]:
             if len(l["topics"]) == 4:
-                cand(l["address"], "event:RoleGranted")["roles"].add(l["topics"][1])
+                item = cand(l["address"], "event:RoleGranted")
+                if item is not None:
+                    item["roles"].add(l["topics"][1])
         safes, safe_status = self._safe_candidates(wallet)
         for s in safes:
-            cand(s, "safe-transaction-service")
+            cand(s, "safe-transaction-service")["safe"] = True
         for a in extra:
             cand(a, "candidates-file")
         coverage["safeTransactionService"] = safe_status
@@ -130,21 +152,45 @@ class Scanner:
             checks.append((addr, addr, "owner()", abi.call_data("owner()"), "address"))
             checks.append((addr, addr, "getNativeOwner()", abi.call_data("getNativeOwner()"), "address"))
             checks.append((addr, addr, "isOwner(wallet)", abi.call_data("isOwner(address)", wallet), "bool"))
+            if c.get("safe"):
+                checks.append((addr, addr, "getThreshold()", abi.call_data("getThreshold()"), "uint"))
+                checks.append((addr, addr, "getOwners()", abi.call_data("getOwners()"), "addresses"))
             for role in sorted(c["roles"]):
                 checks.append((addr, addr, f"hasRole({role},wallet)", abi.call_data("hasRole(bytes32,address)", role, wallet), "bool"))
             for plugin in sorted(c["plugins"]):
                 checks.append((addr, plugin, f"{checksum(plugin)}.getOwnerOf(account)", abi.call_data("getOwnerOf(address)", addr), "address"))
         results = self.multicall([(target, data) for _, target, _, data, _ in checks], block, state)
-        confirmed = {}
+        confirmed, safe_state = {}, {}
         for (addr, _, label, _, kind), (ok, ret) in zip(checks, results):
             if not ok:
+                continue
+            if kind == "uint":
+                safe_state.setdefault(addr, {})["threshold"] = abi.as_uint(ret)
+                continue
+            if kind == "addresses":
+                safe_state.setdefault(addr, {})["owners"] = abi.as_addresses(ret)
                 continue
             hit = abi.as_address(ret) == wallet if kind == "address" else abi.as_bool(ret) is True
             if hit:
                 confirmed.setdefault(addr, []).append(label)
-        owned, dropped = [], []
+        owned, dropped, shared = [], [], []
         for addr, c in sorted(cands.items()):
             entry = {"address": checksum(addr), "sources": sorted(c["sources"])}
+            if c.get("safe"):
+                safe = safe_state.get(addr, {})
+                owners, threshold = safe.get("owners"), safe.get("threshold")
+                if owners is not None and threshold is not None and wallet in owners and threshold >= 1:
+                    entry["owners"] = [checksum(owner) for owner in owners]
+                    entry["threshold"] = threshold
+                    entry["confirmedBy"] = sorted(set(confirmed.get(addr, []) + ["getOwners()", "getThreshold()"]))
+                    if threshold == 1:
+                        owned.append(entry)
+                    else:
+                        shared.append(entry)
+                    continue
+                entry["reason"] = "Safe ownership or threshold could not be confirmed at the report block"
+                dropped.append(entry)
+                continue
             if addr in confirmed:
                 entry["confirmedBy"] = confirmed[addr]
                 if c["roles"]:
@@ -153,7 +199,7 @@ class Scanner:
             else:
                 entry["reason"] = "no view call at the report block names the wallet as owner"
                 dropped.append(entry)
-        return owned, dropped
+        return owned, dropped, shared
 
     # ---- tokens and balances -----------------------------------------------
     def _token_meta(self, tokens, block, state):
@@ -175,7 +221,7 @@ class Scanner:
         delegation = classify_code(code)
 
         cands, pairs, coverage = self._collect(wallet, block, extra_candidates)
-        owned, dropped = self._confirm(wallet, cands, block, state) if cands else ([], [])
+        owned, dropped, shared = self._confirm(wallet, cands, block, state) if cands else ([], [], [])
 
         allowances = []
         if pairs:
@@ -231,6 +277,7 @@ class Scanner:
             "block": block,
             "delegation": delegation,
             "ownedAccounts": owned,
+            "sharedControl": shared,
             "droppedCandidates": dropped,
             "allowances": allowances,
             "valueAtStake": stake,
@@ -238,10 +285,30 @@ class Scanner:
         }
 
     def scan(self, wallets, block=None, candidates=()):
+        wallets, candidates = list(wallets), list(candidates)
+        for value in wallets + candidates:
+            if not is_address(value):
+                raise ValueError(f"bad address: {value!r}")
         if block is None:
             block = int(self.rpc.call("eth_blockNumber", []), 16)
             state = self.rpc
         else:
             state = self.archive
+        # A historical scan must use archive-capable endpoints for log backfill
+        # as well as state reads.  The regular client remains the latest-scan
+        # default.
+        self.history.rpc = state
         extra = [c.lower() for c in candidates]
-        return [self.scan_wallet(w, block, state, extra) for w in wallets]
+        reports = []
+        for wallet in wallets:
+            try:
+                reports.append(self.scan_wallet(wallet, block, state, extra))
+            except (TransportError, RpcError) as e:
+                # RPC outages are isolated to the affected wallet.  Keep the
+                # report pair useful for every other wallet in this invocation.
+                reports.append({"wallet": checksum(wallet), "block": block, "error": str(e)})
+                # An error may be specific to this address or this historical
+                # state request.  A spent rotation list must not prevent the
+                # remaining wallets from receiving their own reports.
+                state.index = 0
+        return reports

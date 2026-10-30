@@ -96,3 +96,23 @@ def as_string(ret: bytes):
             if len(raw) == length:
                 return raw.decode("utf-8", "replace")
     return None
+
+
+def as_addresses(ret: bytes):
+    """An ABI-encoded address array, or None when the response is malformed."""
+    if len(ret) < 64:
+        return None
+    off = _u(ret, 0)
+    if off + 32 > len(ret):
+        return None
+    count = _u(ret, off)
+    start = off + 32
+    if start + 32 * count > len(ret):
+        return None
+    out = []
+    for i in range(count):
+        value = ret[start + 32 * i:start + 32 * (i + 1)]
+        if any(value[:12]):
+            return None
+        out.append("0x" + value[12:].hex())
+    return out

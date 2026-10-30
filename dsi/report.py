@@ -32,7 +32,11 @@ def render_md(reports):
     out = ["# D.S.I exposure report", ""]
     for r in reports:
         label = f" ({r['label']})" if r.get("label") else ""
-        out += [f"## {r['wallet']}{label}", "", f"Block {r['block']}", "",
+        out += [f"## {r['wallet']}{label}", "", f"Block {r['block']}", ""]
+        if r.get("error"):
+            out += [f"Error: {r['error']}", ""]
+            continue
+        out += [
                 "| Section | Item | Detail | Amount |", "| --- | --- | --- | --- |",
                 f"| Delegation | `{r['wallet']}` | {_delegation(r['delegation'])} | |"]
         if not r["ownedAccounts"]:
@@ -42,6 +46,9 @@ def render_md(reports):
             out.append(f"| Owned account | `{o['address']}` | confirmed by {via} | {fmt_amount(o['ethWei'], 18)} ETH |")
             for t in o["tokens"]:
                 out.append(f"| Owned account | `{o['address']}` | {t['symbol']} `{t['token']}` | {fmt_amount(t['raw'], t['decimals'])} {t['symbol']} |")
+        for s in r.get("sharedControl", []):
+            out.append(f"| Shared control | `{s['address']}` | Safe threshold {s['threshold']}; owners "
+                       + ", ".join(f"`{owner}`" for owner in s["owners"]) + " | excluded from value at stake |")
         if not r["allowances"]:
             out.append("| Allowance | none above zero | | |")
         for a in r["allowances"]:

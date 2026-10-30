@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import re
 import sys
 
 from .config import load_config
@@ -19,9 +20,9 @@ def _addresses(path, key):
     out = []
     for item in data:
         entry = item if isinstance(item, dict) else {"address": item}
-        a = entry["address"]
-        if not (isinstance(a, str) and a.startswith("0x") and len(a) == 42):
-            raise SystemExit(f"{path}: not an address: {a!r}")
+        a = entry.get("address")
+        if not (isinstance(a, str) and re.fullmatch(r"0x[0-9a-fA-F]{40}", a)):
+            raise SystemExit(f"{path}: bad address: {a!r}")
         out.append(entry)
     return out
 

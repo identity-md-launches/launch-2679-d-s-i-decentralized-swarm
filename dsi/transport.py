@@ -180,7 +180,7 @@ class RpcClient:
                     self.checked.add(url)
                     self.log(f"{self.label}: using {url}")
                 return self._post(url, method, params)
-            except TransportError as e:
+            except (TransportError, RpcError) as e:
                 if not rotate and url in self.checked:
                     raise
                 self.log(f"{self.label}: {url} failed ({e}); rotating")

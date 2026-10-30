@@ -93,7 +93,11 @@ default. Environment variables override the file:
 
 All state (owners, roles, allowances, balances, ETH via `getEthBalance`, symbols, decimals) is read
 through Multicall3 `0xcA11bde05977b3631167028862bE2a173976CA11` `aggregate3` at the report block,
-with failures allowed per call. Only `eth_getCode` and `eth_getLogs` are separate requests.
+with failures allowed per call. A malformed or short `aggregate3` answer is reported as an error rather
+than treated as a zero balance. Only `eth_getCode` and `eth_getLogs` are separate requests. A Safe
+reported by the Safe Transaction Service is confirmed with `getOwners()` and `getThreshold()`; a
+threshold-one Safe is included in owned-account value, while a higher-threshold Safe is shown as
+**Shared control** and excluded from value at stake.
 
 ## Reading the report
 
@@ -107,6 +111,7 @@ with failures allowed per call. Only `eth_getCode` and `eth_getLogs` are separat
 | `allowances` / **Allowance** | token, spender, current allowance; `unlimited` is true at or above 2^255 (max uint256, including max after the token decremented it) |
 | `valueAtStake` / **Value at stake** | per asset: `wallet` (its ETH, and its balance of approved tokens), `ownedAccounts` (summed), `total` |
 | `historyCoverage` | for each filter, the block range searched and the sources used; an `error` means the filter could not be read and its section may be incomplete |
+| `sharedControl` / **Shared control** | Safes for which this wallet is an owner but more than one signature is required; owners and threshold are reported, but their balances are not counted as individually exposed |
 
 Amounts in `report.json` are decimal strings in base units; `report.md` shows them scaled by decimals.
 
@@ -124,10 +129,14 @@ Amounts in `report.json` are decimal strings in base units; `report.md` shows th
   of `owner()`, `getNativeOwner()`, `isOwner`, `hasRole` or `getOwnerOf` is dropped.
 - **Token coverage.** Owned-account balances are read for the configured `tokens` plus tokens the wallet
   approved; other ERC-20s an owned account holds are not discovered. Prices are not looked up.
-- **History coverage is what `historyCoverage` says.** If the explorer does not answer and
+- **History coverage is what `historyCoverage` says.** The Blockscout watermark stops at the
+  explorer's indexed head, so a lagging explorer never records an unsearched range as covered. If the explorer does not answer and
   `rpcStartBlock` is above 0, that filter starts at `rpcStartBlock`. Logs are not reorg-checked: a scan
   at the very tip can store a log that is later reorged out.
 - **Store integrity.** The cache trusts its files; delete `cacheDir` to rebuild from scratch.
+- **Safe and endpoint availability.** The Safe Transaction Service is advisory and may be unavailable;
+  a wallet-level RPC failure is recorded in the reports while other wallets continue. A Safe threshold
+  of one indicates unilateral execution at that block, not that all other access paths have been found.
 
 ## Tests and fixtures
 
