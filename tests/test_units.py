@@ -367,6 +367,31 @@ class Units(unittest.TestCase):
         self.assertEqual(rpc.index, 0)
         self.assertLess(chain.ranges[-1][1] - chain.ranges[-1][0], 10000)  # last chunk answered, under the cap
 
+    def test_getlogs_rate_limit_rotates_without_shrinking(self):
+        for message in ("daily request count exceeded, request rate limited", "rate limit exceeded"):
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as d:
+                class RateLimitedChain(HttpTransport):
+                    def __init__(self):
+                        super().__init__()
+                        self.requests = []
+
+                    def post_rpc(self, url, body, timeout):
+                        if body["method"] == "eth_chainId":
+                            return {"result": "0x1"}
+                        self.requests.append((url, body["params"][0]))
+                        if url.endswith("one"):
+                            return {"error": {"code": -32005, "message": message}}
+                        return {"result": []}
+
+                cfg = self._cfg(d)
+                chain = RateLimitedChain()
+                rpc = RpcClient(chain, ["https://rpc.one", "https://rpc.two"], 1, 1)
+                _, coverage = LogHistory(cfg, rpc, chain).logs([T_APPROVAL, pad_topic(WALLET)], 40000)
+                self.assertEqual(coverage["toBlock"], 40000)
+                self.assertEqual([u for u, _ in chain.requests], rpc.urls)
+                self.assertEqual([f["fromBlock"] for _, f in chain.requests], ["0x0", "0x0"])
+                self.assertEqual([f["toBlock"] for _, f in chain.requests], [hex(40000)] * 2)
+
     def test_read_only(self):
         forbidden = re.compile(r"eth_send|eth_sign|personal_|signTransaction|private_?key", re.I)
         for dirpath, _, files in os.walk(os.path.join(ROOT, "dsi")):

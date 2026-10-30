@@ -19,6 +19,7 @@ from .transport import RpcError, TransportError
 
 # How public nodes word "this eth_getLogs request is too large" in a JSON-RPC error.
 RANGE_LIMIT = re.compile(r"range|limit|too many|too large|exceed|max(imum)? .*(blocks|results)|response size", re.I)
+RATE_LIMIT = re.compile(r"rate|quota|daily|request count|credits|compute units", re.I)
 
 
 class HistoryUnavailable(Exception):
@@ -176,7 +177,7 @@ class LogHistory:
                 self.getlogs_calls += 1
                 found = self.rpc.call("eth_getLogs", [flt], rotate=False)
             except RpcError as e:
-                if chunk > 1 and RANGE_LIMIT.search(str(e)):
+                if chunk > 1 and RANGE_LIMIT.search(str(e)) and not RATE_LIMIT.search(str(e)):
                     # A range or result-size limit is a property of the request: shrink it.
                     chunk = max(1, chunk // 2)
                     self.log(f"history: eth_getLogs {frm}-{end} refused ({e}); chunk now {chunk}")
@@ -186,6 +187,7 @@ class LogHistory:
                 self.rpc.retire_current(str(e))
                 if self.rpc.index >= len(self.rpc.urls):
                     raise TransportError(f"no endpoint left for eth_getLogs ({e})")
+                chunk = self.h["rpcChunkBlocks"]
                 continue
             except TransportError as e:
                 if self.rpc.index >= len(self.rpc.urls):

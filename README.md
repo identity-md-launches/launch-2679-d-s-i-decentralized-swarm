@@ -79,7 +79,7 @@ default. Environment variables override the file:
    appends them; a second scan over the same range makes no log requests at all. For a missing range
    the Blockscout logs API is asked first; if it does not answer (timeout, 429, error) the range
    comes from chunked `eth_getLogs`, which halves its chunk on any refusal, timeout or JSON-RPC
-   range/result-limit error (any other JSON-RPC error rotates to the next endpoint), doubles it
+   range/result-limit error (rate/quota errors and other JSON-RPC errors rotate to the next endpoint), doubles it
    again after a success, and saves the watermark after every chunk so an interrupted backfill resumes.
 3. **Owned contracts and accounts.** Candidates are the emitting contracts of `OwnershipTransferred`
    and `RoleGranted`, the `account` of the MSCA / plugin events, the Safes the Safe Transaction Service
@@ -143,7 +143,9 @@ Amounts in `report.json` are decimal strings in base units; `report.md` shows th
   a wallet-level RPC failure is recorded in the reports while other wallets continue. A Safe threshold
   of one indicates unilateral execution at that block, not that all other access paths have been found.
 - **Range-limit errors are recognised by wording.** A JSON-RPC `eth_getLogs` error whose message
-  mentions a range, limit or size shrinks the chunk; one worded otherwise retires the endpoint.
+  mentions a range, limit or size shrinks the chunk; rate/quota wording takes precedence and retires
+  the endpoint immediately. After rotation the next endpoint starts with `rpcChunkBlocks` again.
+  Other messages retire the endpoint; unfamiliar throttling wording can still be mistaken for a size limit.
 - **Allowance, Safe, role and pagination paths have no recorded mainnet fixture yet.** They are covered
   by the synthetic chains in `tests/test_units.py` only; the second recording asked for in point 6 of
   the review is still outstanding. The Blockscout indexed-head entry in the incident fixture was added
