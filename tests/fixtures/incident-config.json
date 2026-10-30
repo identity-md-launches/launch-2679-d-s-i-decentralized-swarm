@@ -1,0 +1,11 @@
+{
+  "rpcUrls": ["https://ethereum-rpc.publicnode.com"],
+  "archiveRpcUrls": [],
+  "timeoutSeconds": 30,
+  "history": {
+    "sources": ["blockscout", "rpc"],
+    "blockscoutTimeoutSeconds": 45,
+    "rpcStartBlock": 26290000,
+    "rpcChunkBlocks": 20000
+  }
+}

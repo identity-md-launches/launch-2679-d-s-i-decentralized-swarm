@@ -1,0 +1,5 @@
+.dsi-cache/
+report.json
+report.md
+__pycache__/
+test/scratch/

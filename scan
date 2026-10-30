@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+"""Entry point: ./scan --wallets wallets.json [--block N] [--candidates candidates.json]"""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from dsi.cli import main  # noqa: E402
+
+main(sys.argv[1:])
